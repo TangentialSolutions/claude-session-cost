@@ -151,31 +151,171 @@ class Session:
         self.unknown_models = {}   # model -> tokens not priced
         self.messages = 0
         self.sidechain_cost = 0.0
+        self.usage = Usage()
+
+# ---------------------------------------------------------------------------
+# Usage tracking (skills, MCP, rules/memory files, Bash commands)
+# ---------------------------------------------------------------------------
+WRAPPERS = {"sudo", "env", "time", "nohup", "nice", "exec", "command", "builtin", "xargs", "timeout", "stdbuf"}
+ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+def bash_base_commands(cmd):
+    """Base command(s) of a shell command line.
+
+    'cd app && FOO=1 sudo -E npm test | tee x' -> ['npm', 'tee'].  Splits on && || ; | and newlines,
+    skips cd/pushd/popd/export/source segments, env assignments, and wrappers like sudo/env/time
+    (with their flags), and strips paths (/usr/bin/git -> git).
+    """
+    import shlex
+    out = []
+    try:
+        lex = shlex.shlex((cmd or "").replace("\n", " ; "), posix=True, punctuation_chars=";&|()")
+        lex.whitespace_split = True
+        lex.commenters = "#"
+        toks = list(lex)
+    except ValueError:  # unbalanced quotes: fall back to a naive split
+        toks = re.sub(r"(&&|\|\||[;|()])", r" \1 ", cmd or "").split()
+    segs, cur = [], []
+    for t in toks:
+        if t and set(t) <= set(";&|()"):
+            segs.append(cur); cur = []
+        else:
+            cur.append(t)
+    segs.append(cur)
+    for words in segs:
+        i = 0
+        while i < len(words):
+            w = words[i]
+            if ASSIGN.match(w) or w in ("(", "{", "!"):
+                i += 1
+            elif w in WRAPPERS:
+                i += 1
+                while i < len(words) and (words[i].startswith("-") or (w == "timeout" and re.match(r"^\d", words[i]))):
+                    i += 1
+            else:
+                break
+        if i >= len(words):
+            continue
+        base = os.path.basename(words[i].lstrip("({"))
+        if base and base not in ("cd", "pushd", "popd", "export", "source", ".", "true", ":"):
+            out.append(base)
+    return out
+
+def est_tokens(content):
+    """Rough token estimate for tool_result content: ~4 characters per token (images ~1.6k each)."""
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return (len(content) + 3) // 4
+    n = 0
+    for b in content if isinstance(content, list) else [content]:
+        if isinstance(b, dict):
+            if b.get("type") == "image":
+                n += 1600
+            else:
+                n += est_tokens(b.get("text") or b.get("content") or "")
+        else:
+            n += est_tokens(str(b))
+    return n
+
+RULE_NAME = re.compile(r"(^|/)(CLAUDE(\.local)?\.md|AGENTS\.md)$|/\.claude/(rules|memory|memories)/|/memory/.*\.md$", re.I)
+REMINDER_FILE = re.compile(r"Contents of (\S+?\.md)\b")
+IMPORT_RE = re.compile(r"(?:^|\s)@((?:~|\.{0,2})/?[\w./-]+\.md)\b")
+CMD_RE = re.compile(r"<command-name>\s*/?([^<\s]+)\s*</command-name>")
+
+class Usage:
+    def __init__(self):
+        self.skills = {}        # name -> count
+        self.slash = {}         # /command -> count
+        self.mcp = {}           # "server/tool" -> {"calls", "result_tokens_est", "result_cost_est", "output_tokens_est"}
+        self.tools = {}         # tool name -> count (all tools)
+        self.bash = {}          # base command -> count
+        self.rules = {}         # path -> set(how)
+
+    def add(self, other):
+        for attr in ("skills", "slash", "tools", "bash"):
+            d = getattr(self, attr)
+            for k, v in getattr(other, attr).items():
+                d[k] = d.get(k, 0) + v
+        for k, v in other.mcp.items():
+            d = self.mcp.setdefault(k, {"calls": 0, "result_tokens_est": 0, "result_cost_est": 0.0, "output_tokens_est": 0.0})
+            for f in d:
+                d[f] += v[f]
+        for k, v in other.rules.items():
+            self.rules.setdefault(k, set()).update(v)
+
+    def to_json(self):
+        return {"skills": self.skills, "slash_commands": self.slash, "tools": self.tools, "bash_commands": self.bash,
+                "mcp": {k: {**v, "result_cost_est": round(v["result_cost_est"], 6),
+                            "output_tokens_est": round(v["output_tokens_est"])} for k, v in self.mcp.items()},
+                "rules_files": {k: sorted(v) for k, v in self.rules.items()},
+                "_note": "mcp *_est fields are estimates (tool_result chars/4 priced at the model's base input rate; "
+                         "issuing turn's output split evenly across its tool calls)"}
+
+def _texts(content):
+    if isinstance(content, str):
+        yield content
+    elif isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict):
+                if b.get("type") == "text":
+                    yield b.get("text") or ""
+                elif b.get("type") == "tool_result":
+                    yield from _texts(b.get("content"))
 
 def analyze(paths, table=None, since=None):
     """Parse transcript files into {session_id: Session}, deduping API responses."""
     table = table or load_pricing()
-    seen = {}      # dedupe key -> (session, tokens, model, fast, sidechain)
+    seen = {}       # dedupe key -> (session, tokens, model, fast, sidechain)
+    calls = {}      # tool_use id -> (sid, name, input, msg key)
+    blocks_per_msg = {}
+    results = {}    # tool_use id -> est tokens
     meta = {}
+    extra = {}      # sid -> Usage (slash commands, rules)
     for path in paths:
         for e in iter_jsonl(path):
-            if e.get("type") != "assistant":
-                continue
-            msg = e.get("message") or {}
-            usage = msg.get("usage")
-            model = msg.get("model")
-            if not usage or model == "<synthetic>":
-                continue
             ts = e.get("timestamp")
             if since and ts and ts < since:
                 continue
             sid = e.get("sessionId") or os.path.splitext(os.path.basename(path))[0]
+            u = extra.setdefault(sid, Usage())
+            msg = e.get("message") or {}
+            content = msg.get("content") if isinstance(msg, dict) else None
+            # --- rules / memory files and slash commands (any entry type) ---
+            att = e.get("attachment") or {}
+            if isinstance(att, dict) and att.get("path") and ("memory" in str(att.get("type", "")).lower() or RULE_NAME.search(att["path"])):
+                u.rules.setdefault(att["path"], set()).add("attachment:" + str(att.get("type")))
+            for t in _texts(content):
+                for p in REMINDER_FILE.findall(t):
+                    u.rules.setdefault(p, set()).add("system-reminder")
+                if e.get("type") == "user":
+                    for c in CMD_RE.findall(t):
+                        u.slash["/" + c] = u.slash.get("/" + c, 0) + 1
+                    if not t.lstrip().startswith("<"):
+                        for p in IMPORT_RE.findall(t):
+                            u.rules.setdefault(p, set()).add("@-mention")
+            if e.get("type") == "user" and isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id"):
+                        results[b["tool_use_id"]] = est_tokens(b.get("content"))
+            if e.get("type") != "assistant":
+                continue
+            usage = msg.get("usage")
+            model = msg.get("model")
+            if not usage or model == "<synthetic>":
+                continue
             # Streaming writes one line per content block, all sharing message.id/requestId
             # and repeating the usage. Keep one per (message.id, requestId); later lines win
             # since they carry the final output_tokens.
             key = (msg.get("id"), e.get("requestId"))
             if key == (None, None):
                 key = ("uuid", e.get("uuid") or id(e))
+            for b in content if isinstance(content, list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    tid = b.get("id") or f"{key}:{len(calls)}"
+                    if tid not in calls:
+                        calls[tid] = (sid, b.get("name") or "?", b.get("input") or {}, key)
+                        blocks_per_msg[key] = blocks_per_msg.get(key, 0) + 1
             tokens = split_usage(usage)
             fast = (usage.get("speed") == "fast")
             prev = seen.get(key)
@@ -202,6 +342,37 @@ def analyze(paths, table=None, since=None):
         s.models[model] = s.models.get(model, 0) + c
         if side:
             s.sidechain_cost += c
+    # --- tool calls ---
+    for tid, (sid, name, inp, key) in calls.items():
+        s = sessions.get(sid) or sessions.setdefault(sid, Session(sid))
+        u = s.usage
+        u.tools[name] = u.tools.get(name, 0) + 1
+        if name == "Skill":
+            sk = inp.get("skill") or inp.get("command") or inp.get("name") or "?"
+            u.skills[sk] = u.skills.get(sk, 0) + 1
+        elif name == "Bash":
+            for b in bash_base_commands(inp.get("command", "")):
+                u.bash[b] = u.bash.get(b, 0) + 1
+        elif name.startswith("mcp__"):
+            parts = name.split("__", 2)
+            label = f"{parts[1]}/{parts[2]}" if len(parts) == 3 else name
+            d = u.mcp.setdefault(label, {"calls": 0, "result_tokens_est": 0, "result_cost_est": 0.0, "output_tokens_est": 0.0})
+            d["calls"] += 1
+            rt = results.get(tid, 0)
+            d["result_tokens_est"] += rt
+            msg_info = seen.get(key)
+            if msg_info:
+                rates, _ = price_for(msg_info[2], table)
+                if rates:
+                    d["result_cost_est"] += rt * rates["input"] / 1e6
+                d["output_tokens_est"] += msg_info[1]["output"] / max(1, blocks_per_msg.get(key, 1))
+        if name in ("Read", "Edit", "Write", "MultiEdit"):
+            fp = inp.get("file_path") or ""
+            if RULE_NAME.search(fp):
+                u.rules.setdefault(fp, set()).add(f"{name} tool")
+    for sid, x in extra.items():
+        if sid in sessions:
+            sessions[sid].usage.add(x)
     for sid, s in sessions.items():
         m = meta.get(sid, {})
         s.project, s.first, s.last = m.get("project"), m.get("first"), m.get("last")
@@ -249,6 +420,9 @@ def statusline(data, table=None):
             parts.append(c("2", f"(cc {fmt_usd(cc_cost)})"))
         parts.append(f"in {fmt_tok(t['input'])} · out {fmt_tok(t['output'])} · "
                      f"cw {fmt_tok(t['cache_write_5m'] + t['cache_write_1h'])} · cr {fmt_tok(t['cache_read'])}")
+        nt = sum(s.usage.tools.values()); nm = sum(v["calls"] for v in s.usage.mcp.values())
+        if nt:
+            parts.append(c("2", f"tools {nt}" + (f" · mcp {nm}" if nm else "")))
         if s.unknown_models:
             parts.append(c("31", "?unpriced model"))
     elif cc_cost is not None:
@@ -289,6 +463,51 @@ def report(sessions, limit=None):
     out.append(c("2", f"API list prices from {PRICING_SOURCE} ({PRICING_DATE}). Estimate only; see README."))
     return "\n".join(out)
 
+def top(d, n=8, key=None):
+    items = sorted(d.items(), key=key or (lambda kv: -kv[1]))
+    s = ", ".join(f"{k} ×{v}" for k, v in items[:n])
+    return s + (f", +{len(items) - n} more" if len(items) > n else "") if items else "-"
+
+def usage_report(sessions, limit=None):
+    rows = sorted(sessions.values(), key=lambda s: s.last or "", reverse=True)
+    if limit:
+        rows = rows[:limit]
+    total = Usage()
+    out = [c("1", "Per-session usage")]
+    for s in rows:
+        u = s.usage; total.add(u)
+        proj = os.path.basename((s.project or "").rstrip("/")) or "-"
+        nm = sum(v["calls"] for v in u.mcp.values())
+        out.append(c("36", f"{s.id[:8]}  {proj}") + c("2", f"  tools {sum(u.tools.values())} · mcp {nm} · bash {sum(u.bash.values())} · skills {sum(u.skills.values())}"))
+        if u.skills or u.slash:
+            out.append(f"  skills  {top(u.skills)}" + (f"   slash {top(u.slash)}" if u.slash else ""))
+        if u.mcp:
+            out.append(f"  mcp     {top({k: v['calls'] for k, v in u.mcp.items()}, 5)}")
+        if u.bash:
+            out.append(f"  bash    {top(u.bash)}")
+        if u.rules:
+            out.append(f"  rules   {', '.join(sorted('/'.join(p.rstrip('/').split('/')[-2:]) for p in u.rules))}")
+    out.append("")
+    out.append(c("1", f"Totals across {len(rows)} sessions"))
+    out.append(c("33", "Skills") + f"   {top(total.skills, 20)}")
+    if total.slash:
+        out.append(c("33", "Slash") + f"    {top(total.slash, 20)}")
+    out.append(c("33", "Bash") + f"     {top(total.bash, 20)}")
+    out.append(c("33", "Tools") + f"    {top(total.tools, 20)}")
+    out.append(c("33", "MCP") + c("2", "  (result tokens & cost are ESTIMATES: chars/4 at the model's input rate; out = issuing turn's output split across its calls)"))
+    if total.mcp:
+        out.append(f"  {'server/tool':<36} {'calls':>5} {'~result tok':>11} {'~result $':>9} {'~out tok':>9}")
+        for k, v in sorted(total.mcp.items(), key=lambda kv: -kv[1]["calls"]):
+            out.append(f"  {k[:36]:<36} {v['calls']:>5} {'~' + fmt_tok(v['result_tokens_est']):>11} {'~' + fmt_usd(v['result_cost_est']):>9} {'~' + fmt_tok(round(v['output_tokens_est'])):>9}")
+    else:
+        out.append("  -")
+    out.append(c("33", "Rules/memory files seen") + c("2", "  (only what the transcript reveals; auto-loaded CLAUDE.md usually is NOT logged)"))
+    for p, how in sorted(total.rules.items()):
+        out.append(f"  {p}  " + c("2", f"[{', '.join(sorted(how))}]"))
+    if not total.rules:
+        out.append("  - none detected")
+    return "\n".join(out)
+
 def find_transcripts(root):
     return sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True))
 
@@ -303,6 +522,7 @@ def main(argv=None):
     r.add_argument("--dir", default=os.path.join(os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude")), "projects"),
                    help="transcripts root (default ~/.claude/projects)")
     r.add_argument("--json", action="store_true", help="machine-readable output")
+    r.add_argument("--usage", action="store_true", help="skills, MCP, Bash and rules-file usage instead of the cost table")
     sub.add_parser("pricing", help="print the active pricing table")
     a = p.parse_args(argv)
     cmd = a.cmd or ("statusline" if not sys.stdin.isatty() else None)
@@ -330,9 +550,17 @@ def main(argv=None):
         if a.json:
             rows = [{"session_id": s.id, "project": s.project, "first": s.first, "last": s.last,
                      "cost_usd": round(s.cost, 6), "sidechain_cost_usd": round(s.sidechain_cost, 6),
-                     "tokens": s.tokens, "models": s.models, "unpriced_models": s.unknown_models}
+                     "tokens": s.tokens, "models": s.models, "unpriced_models": s.unknown_models,
+                     "usage": s.usage.to_json()}
                     for s in sorted(sessions.values(), key=lambda s: s.last or "", reverse=True)]
-            print(json.dumps(rows[: a.last or None], indent=2))
+            rows = rows[: a.last or None]
+            tot = Usage()
+            for s in sorted(sessions.values(), key=lambda s: s.last or "", reverse=True)[: a.last or None]:
+                tot.add(s.usage)
+            print(json.dumps({"sessions": rows, "totals": {"cost_usd": round(sum(r["cost_usd"] for r in rows), 6),
+                                                            "usage": tot.to_json()}}, indent=2))
+        elif a.usage:
+            print(usage_report(sessions, a.last or None))
         else:
             print(report(sessions, a.last or None))
         return 0

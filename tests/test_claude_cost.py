@@ -82,7 +82,7 @@ class T(unittest.TestCase):
         buf = io.StringIO()
         with redirect_stdout(buf):
             cc.main(["report", "--dir", os.path.join(HERE, "fixtures", "demo"), "-n", "0", "--json"])
-        rows = json.loads(buf.getvalue())
+        rows = json.loads(buf.getvalue())["sessions"]
         self.assertEqual(len(rows), 8)
         self.assertTrue(all(r["cost_usd"] > 0 for r in rows))
         late = cc.analyze(cc.find_transcripts(os.path.join(HERE, "fixtures", "demo")), since="2026-10-26T00:00:00")
@@ -90,3 +90,60 @@ class T(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+USID = "22222222-aaaa-bbbb-cccc-000000000002"
+UFILE = os.path.join(HERE, "fixtures", "usage", USID + ".jsonl")
+
+class Usage(unittest.TestCase):
+    def setUp(self):
+        self.s = cc.analyze([UFILE])[USID]
+        self.u = self.s.usage
+
+    def test_bash_parsing(self):
+        f = cc.bash_base_commands
+        self.assertEqual(f("cd app && FOO=1 sudo -E npm test | tee out.log"), ["npm", "tee"])
+        self.assertEqual(f("/usr/bin/git status"), ["git"])
+        self.assertEqual(f("env A=1 B=2 timeout 30 python3 x.py; cd /; ls"), ["python3", "ls"])
+        self.assertEqual(f("cd foo"), [])
+        self.assertEqual(f("echo 'a && b' && make"), ["echo", "make"])
+        self.assertEqual(f("unbalanced 'quote"), ["unbalanced"])
+
+    def test_skills_and_slash(self):
+        self.assertEqual(self.u.skills, {"pdf": 2})
+        self.assertEqual(self.u.slash, {"/review": 1})
+
+    def test_tool_counts_dedupe_streaming(self):
+        # msg_1 streamed over 3 lines; each tool_use counted once
+        self.assertEqual(self.u.tools["Skill"], 2)
+        self.assertEqual(self.u.tools["Bash"], 2)
+        self.assertEqual(self.s.messages, 3)
+
+    def test_mcp_attribution(self):
+        gh = self.u.mcp["github/search_issues"]
+        self.assertEqual(gh["calls"], 2)
+        self.assertEqual(gh["result_tokens_est"], 1000 + 200)          # 4000 chars/4 + 800 chars/4
+        self.assertAlmostEqual(gh["result_cost_est"], 1200 * 3 / 1e6)  # sonnet-4-5 input rate
+        self.assertAlmostEqual(gh["output_tokens_est"], 400 / 2 + 300 / 4)
+        self.assertEqual(self.u.mcp["linear-server/create_issue"]["calls"], 1)
+
+    def test_rules(self):
+        r = self.u.rules
+        self.assertIn("system-reminder", r["/home/dev/acme-api/CLAUDE.md"])
+        self.assertIn("Read tool", r["/home/dev/.claude/CLAUDE.md"])
+        self.assertIn("attachment:nested_memory", r["/home/dev/acme-api/src/CLAUDE.md"])
+        self.assertIn("@-mention", r["docs/STYLE.md"])
+
+    def test_usage_report_and_json(self):
+        txt = cc.usage_report({USID: self.s})
+        for needle in ("pdf ×2", "github/search_issues", "ESTIMATES", "npm ×1", "src/CLAUDE.md"):
+            self.assertIn(needle, txt)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cc.main(["report", "--dir", os.path.dirname(UFILE), "--json"])
+        d = json.loads(buf.getvalue())
+        self.assertEqual(d["totals"]["usage"]["bash_commands"], {"npm": 1, "tee": 1, "git": 1})
+        self.assertEqual(d["sessions"][0]["usage"]["skills"], {"pdf": 2})
+
+    def test_statusline_segment(self):
+        line = cc.statusline({"session_id": USID, "transcript_path": UFILE, "model": {"display_name": "Sonnet"}})
+        self.assertIn("tools 8 · mcp 3", line)

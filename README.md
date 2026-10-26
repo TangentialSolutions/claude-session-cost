@@ -11,7 +11,7 @@ See what each Claude Code session costs: a running per-session dollar figure in 
 **Statusline** (updates after every assistant message):
 
 ```
-[Opus 5.5] │ $1.62 │ (cc $1.59) │ in 612 · out 32.0k · cw 84.4k · cr 1.5M
+[Opus 5.5] │ $1.77 │ (cc $1.59) │ in 520 · out 37.0k · cw 94.0k · cr 1.4M │ tools 30 · mcp 6
 ```
 
 | Part | Meaning |
@@ -20,6 +20,7 @@ See what each Claude Code session costs: a running per-session dollar figure in 
 | `$1.62` | session cost **computed by this tool** from the transcript |
 | `(cc $1.59)` | Claude Code's own `cost.total_cost_usd` estimate, shown as a cross-check |
 | `in / out / cw / cr` | uncached input, output, cache-write (5m + 1h), cache-read tokens for the session |
+| `tools N · mcp M` | (dim) tool calls this session, of which MCP calls. See `report --usage` for the breakdown |
 | `?unpriced model` | (red) a model in the transcript isn't in the pricing table, so its tokens aren't counted |
 
 **Report** (`claude-cost report`): one row per session (most recent first), with last activity (local time), short session id, project, main model, token columns and cost, plus a total row. Options:
@@ -29,9 +30,26 @@ claude_cost.py report            # last 10 sessions
 claude_cost.py report -n 0       # all sessions
 claude_cost.py report --today    # usage since local midnight
 claude_cost.py report --days 7 -n 0
-claude_cost.py report --json     # machine-readable (includes sidechain cost + per-model breakdown)
+claude_cost.py report --usage    # skills, slash commands, MCP, Bash commands, rules files: per session + totals
+claude_cost.py report --json     # machine-readable: {"sessions": [...], "totals": {...}}, each with "usage"
 claude_cost.py pricing           # print the active pricing table
 ```
+
+**Usage view** (`report --usage`), rendered from fake fixture data:
+
+![usage report rendered from fake fixture data](docs/usage-report.png)
+
+> **JSON shape changed in v0.2:** `report --json` used to print a bare list of sessions. It now prints `{"sessions": [...], "totals": {"cost_usd", "usage"}}`.
+
+## What's measured vs estimated vs not detectable
+
+| Category | Measured (exact, from the transcript) | Estimated | Not detectable |
+| --- | --- | --- | --- |
+| **Skills** | `Skill` tool calls, counted by `input.skill`. Slash commands from `<command-name>/x</command-name>` markers are listed separately. | none | Skills whose instructions were loaded without a `Skill` tool call. A slash command that maps to a skill is counted as a slash command, not as a skill. |
+| **MCP** | Calls per `server/tool`, parsed from `mcp__<server>__<tool>` tool names and deduped by tool-use id. | `~result tok` = tool_result characters ÷ 4 (images count as 1,600). `~result $` = those tokens × the model's base input rate. `~out tok` = the issuing response's output tokens split evenly across its tool calls. | Real per-tool token counts: the API bills per response, not per tool. Re-reads of the result on later turns (cache reads) and MCP tool *definitions* in the system prompt are also not attributed. |
+| **Rules / memory** | Files that show up in the transcript: `attachment` entries (e.g. nested memory), `Contents of …CLAUDE.md` system reminders, Read/Edit/Write on `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.claude/rules/`, `.claude/memory/` or `memory/*.md`, and `@file.md` mentions in prompts. The report lists *how* each was seen. | none | **Auto-loaded CLAUDE.md files (user, project, enterprise) are usually injected into the system prompt and NOT written to the transcript**, so a missing entry does *not* mean the file wasn't used. Imports inside CLAUDE.md files are not detectable either, and nothing is counted per use. |
+| **Bash** | Base command per segment of `&&`, `\|\|`, `;`, `\|` and newlines (quote-aware). Skipped: leading `VAR=…` assignments, wrappers (`sudo`, `env`, `time`, `nohup`, `nice`, `timeout`, `xargs`, `exec`, `command`, `stdbuf`) and their flags, and `cd`/`pushd`/`export`/`source`. Paths are reduced to the basename. | none | Commands inside `bash -c "…"`, `$(…)`, scripts, functions and aliases. Here-docs and complex shell syntax are parsed best-effort. |
+| **All tools** | Count per tool name (`Read`, `Edit`, `Task`, …). | none | Calls made by subagents whose transcripts aren't on disk. |
 
 ## Install (one command)
 
