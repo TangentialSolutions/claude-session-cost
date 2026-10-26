@@ -105,6 +105,30 @@ def usage():
     ]
     write(os.path.join(HERE, "fixtures", "usage", sid + ".jsonl"), rows)
 
+def gap():
+    """Sonnet 4.5 [1m] session with 2 subagents, built to reproduce the ways claude-cost used to under-count."""
+    sid = "33333333-aaaa-bbbb-cccc-000000000003"
+    M = "claude-sonnet-4-5-20250929[1m]"
+    T = "2026-10-26T15:%02d:00.000Z"
+    d = os.path.join(HERE, "fixtures", "gap")
+    def U(inp, cr, cw, out):  # no cache_creation split (older transcripts)
+        return {"input_tokens": inp, "output_tokens": out, "cache_creation_input_tokens": cw, "cache_read_input_tokens": cr}
+    main = [asst(sid, "g1", "r1", M, U(2000, 150000, 20000, 3000), T % 1, content=[tu("a1", "Task", {"prompt": "x"}), tu("a2", "Task", {"prompt": "y"})]),
+            # >200k prompt: long-context tier on Sonnet 4.5 1M beta
+            asst(sid, "g2", "r2", M, U(1000, 230000, 10000, 4000), T % 2),
+            asst(sid, "g3", "r3", M, U(1000, 240000, 5000, 2000), T % 3)]
+    write(os.path.join(d, sid + ".jsonl"), main)
+    # subagent 1: current layout, but its lines carry no sessionId
+    sub1 = [asst(sid, "s1", "q1", "claude-sonnet-4-5-20250929", U(500, 40000, 8000, 1500), T % 4) for _ in range(1)]
+    for r in sub1: r.pop("sessionId"); r["agentId"] = "aaaa1111"
+    write(os.path.join(d, sid, "subagents", "agent-aaaa1111.jsonl"), sub1)
+    # subagent 2: older layout, sibling agent-*.jsonl in the project dir
+    write(os.path.join(d, "agent-bbbb2222.jsonl"),
+          [asst(sid, "s2", "q2", "claude-sonnet-4-5-20250929", U(500, 30000, 6000, 1200), T % 5, side=True)])
+    # unrelated sibling agent file from another session: must NOT be attributed
+    write(os.path.join(d, "agent-cccc3333.jsonl"),
+          [asst("99999999-0000-0000-0000-000000000000", "s3", "q3", "claude-sonnet-4-5-20250929", U(1, 0, 0, 1), T % 6, side=True)])
+
 def demo_usage(rng, i, t):
     """Fake tool_use blocks for the demo screenshot."""
     pool = [("Bash", {"command": c}) for c in ["git status", "cd web && pnpm test", "npm run build", "rg TODO src",
@@ -116,4 +140,4 @@ def demo_usage(rng, i, t):
     return [tu(f"tu_{i}_{t}_{j}", *rng.choice(pool)) for j in range(k)]
 
 if __name__ == "__main__":
-    basic(); demo(); usage()
+    basic(); demo(); usage(); gap()

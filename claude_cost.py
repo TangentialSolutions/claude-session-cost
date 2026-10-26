@@ -6,7 +6,7 @@
 
 Single file, Python 3.8+ standard library only. MIT licensed.
 """
-import argparse, datetime as dt, glob, json, os, re, sys
+import argparse, datetime as dt, glob, html, json, os, re, sys, urllib.parse
 
 # ---------------------------------------------------------------------------
 # Pricing (USD per million tokens).
@@ -36,8 +36,14 @@ PRICING = {
     "sonnet-5-5": {"input": 2,    "cache_write_5m": 2.5,   "cache_write_1h": 4,    "cache_read": 0.10, "output": 10},
     "sonnet-5":   {"input": 2,    "cache_write_5m": 2.5,   "cache_write_1h": 4,    "cache_read": 0.20, "output": 10},
     "sonnet-4-6": {"input": 3,    "cache_write_5m": 3.75,  "cache_write_1h": 6,    "cache_read": 0.30, "output": 15},
-    "sonnet-4-5": {"input": 3,    "cache_write_5m": 3.75,  "cache_write_1h": 6,    "cache_read": 0.30, "output": 15},
-    "sonnet-4":   {"input": 3,    "cache_write_5m": 3.75,  "cache_write_1h": 6,    "cache_read": 0.30, "output": 15},
+    # Sonnet 4.5 / 4 with the 1M-context beta ("[1m]" model ids): prompts over 200k tokens are billed at
+    # 2x input (and cache) and 1.5x output. https://claude.com/blog/1m-context . Claude 4.6+ have no premium.
+    "sonnet-4-5": {"input": 3,    "cache_write_5m": 3.75,  "cache_write_1h": 6,    "cache_read": 0.30, "output": 15,
+                   "long_threshold": 200000,
+                   "long": {"input": 6, "cache_write_5m": 7.5, "cache_write_1h": 12, "cache_read": 0.60, "output": 22.5}},
+    "sonnet-4":   {"input": 3,    "cache_write_5m": 3.75,  "cache_write_1h": 6,    "cache_read": 0.30, "output": 15,
+                   "long_threshold": 200000,
+                   "long": {"input": 6, "cache_write_5m": 7.5, "cache_write_1h": 12, "cache_read": 0.60, "output": 22.5}},
     # Haiku 5.5 is priced by prompt length: prompts over 100k tokens (input+cache) use "long".
     "haiku-5-5":  {"input": 0.10, "cache_write_5m": 0.125, "cache_write_1h": 0.20, "cache_read": 0.01, "output": 0.50,
                    "long_threshold": 100000,
@@ -87,19 +93,27 @@ def price_for(model, table):
 # ---------------------------------------------------------------------------
 FIELDS = ("input", "cache_write_5m", "cache_write_1h", "cache_read", "output")
 
-def split_usage(u):
+def default_cache_ttl():
+    """TTL assumed for cache writes the transcript doesn't split into 5m/1h (CLAUDE_COST_CACHE_TTL=5m|1h)."""
+    v = (os.environ.get("CLAUDE_COST_CACHE_TTL") or "5m").strip().lower()
+    return "1h" if v in ("1h", "60m", "3600") else "5m"
+
+def split_usage(u, default_ttl="5m"):
     """Map an Anthropic usage object to our five buckets.
 
     cache_creation_input_tokens is split via usage.cache_creation.ephemeral_{5m,1h}_input_tokens
-    when present; otherwise all cache writes are treated as 5-minute writes.
+    when present; any unsplit remainder is priced at default_ttl (5m unless told otherwise).
     """
     u = u or {}
     cw_total = int(u.get("cache_creation_input_tokens") or 0)
     cc = u.get("cache_creation") or {}
     w5 = int(cc.get("ephemeral_5m_input_tokens") or 0)
     w1 = int(cc.get("ephemeral_1h_input_tokens") or 0)
-    if w5 + w1 < cw_total:          # unsplit remainder -> 5m (the API default TTL)
-        w5 += cw_total - (w5 + w1)
+    if w5 + w1 < cw_total:          # unsplit remainder -> default TTL (API default is 5m)
+        if default_ttl == "1h":
+            w1 += cw_total - (w5 + w1)
+        else:
+            w5 += cw_total - (w5 + w1)
     return {
         "input": int(u.get("input_tokens") or 0),
         "cache_write_5m": w5,
@@ -152,6 +166,18 @@ class Session:
         self.messages = 0
         self.sidechain_cost = 0.0
         self.usage = Usage()
+
+    def merge(self, o):
+        for k, v in o.tokens.items():
+            self.tokens[k] = self.tokens.get(k, 0) + v
+        self.cost += o.cost; self.sidechain_cost += o.sidechain_cost; self.messages += o.messages
+        for d, od in ((self.models, o.models), (self.unknown_models, o.unknown_models)):
+            for k, v in od.items():
+                d[k] = d.get(k, 0) + v
+        self.usage.add(o.usage)
+        self.project = self.project or o.project
+        self.first = min(x for x in (self.first, o.first) if x) if (self.first or o.first) else None
+        self.last = max(x for x in (self.last, o.last) if x) if (self.last or o.last) else None
 
 # ---------------------------------------------------------------------------
 # Usage tracking (skills, MCP, rules/memory files, Bash commands)
@@ -263,9 +289,17 @@ def _texts(content):
                 elif b.get("type") == "tool_result":
                     yield from _texts(b.get("content"))
 
-def analyze(paths, table=None, since=None):
+def default_sid(path):
+    """Session id for entries without sessionId: <sid>.jsonl, or <sid>/subagents/agent-x.jsonl -> <sid>."""
+    d = os.path.dirname(path)
+    if os.path.basename(d) == "subagents":
+        return os.path.basename(os.path.dirname(d))
+    return os.path.splitext(os.path.basename(path))[0]
+
+def analyze(paths, table=None, since=None, default_ttl=None):
     """Parse transcript files into {session_id: Session}, deduping API responses."""
     table = table or load_pricing()
+    default_ttl = default_ttl or default_cache_ttl()
     seen = {}       # dedupe key -> (session, tokens, model, fast, sidechain)
     calls = {}      # tool_use id -> (sid, name, input, msg key)
     blocks_per_msg = {}
@@ -277,7 +311,7 @@ def analyze(paths, table=None, since=None):
             ts = e.get("timestamp")
             if since and ts and ts < since:
                 continue
-            sid = e.get("sessionId") or os.path.splitext(os.path.basename(path))[0]
+            sid = e.get("sessionId") or default_sid(path)
             u = extra.setdefault(sid, Usage())
             msg = e.get("message") or {}
             content = msg.get("content") if isinstance(msg, dict) else None
@@ -316,12 +350,15 @@ def analyze(paths, table=None, since=None):
                     if tid not in calls:
                         calls[tid] = (sid, b.get("name") or "?", b.get("input") or {}, key)
                         blocks_per_msg[key] = blocks_per_msg.get(key, 0) + 1
-            tokens = split_usage(usage)
+            tokens = split_usage(usage, default_ttl)
             fast = (usage.get("speed") == "fast")
             prev = seen.get(key)
             if prev and prev[1]["output"] > tokens["output"]:
                 tokens = prev[1]
-            seen[key] = (sid, tokens, model, fast, bool(e.get("isSidechain")))
+            side = bool(e.get("isSidechain"))
+            if prev:  # e.g. /btw sidechain files re-log parent turns: keep the first (main) attribution
+                sid, side = prev[0], prev[4] and side
+            seen[key] = (sid, tokens, model, fast, side)
             m = meta.setdefault(sid, {"project": None, "first": ts, "last": ts})
             m["project"] = m["project"] or e.get("cwd")
             if ts:
@@ -378,11 +415,24 @@ def analyze(paths, table=None, since=None):
         s.project, s.first, s.last = m.get("project"), m.get("first"), m.get("last")
     return sessions
 
+def _file_session_id(path, max_lines=20):
+    for i, e in enumerate(iter_jsonl(path)):
+        if e.get("sessionId"):
+            return e["sessionId"]
+        if i >= max_lines:
+            break
+    return None
+
 def session_files(transcript_path):
-    """Main transcript plus any subagent transcripts stored beside it (<session>/subagents/*.jsonl)."""
+    """Main transcript plus subagent transcripts: <session>/subagents/*.jsonl (current layout) and
+    sibling agent-*.jsonl files in the project dir whose sessionId matches (older layout)."""
     files = [transcript_path]
     base = os.path.splitext(transcript_path)[0]
     files += sorted(glob.glob(os.path.join(base, "subagents", "*.jsonl")))
+    sid = os.path.basename(base)
+    for f in sorted(glob.glob(os.path.join(os.path.dirname(transcript_path), "agent-*.jsonl"))):
+        if _file_session_id(f) == sid:
+            files.append(f)
     return files
 
 # ---------------------------------------------------------------------------
@@ -403,14 +453,35 @@ def fmt_usd(x):
     if x is None: return "n/a"
     return f"${x:.4f}" if x < 0.01 else f"${x:.2f}"
 
-def statusline(data, table=None):
+def links_enabled(flag=None):
+    if flag is False:
+        return False
+    return (os.environ.get("CLAUDE_COST_LINKS", "1").strip().lower() not in ("0", "false", "no", "off")
+            and os.environ.get("TERM_PROGRAM") != "Apple_Terminal")  # Terminal.app prints OSC 8 as garbage
+
+def osc8(url, text):
+    return f"\033]8;;{url}\a{text}\033]8;;\a"
+
+def file_url(path, frag=""):
+    # empty authority (file:///...): Ghostty blocks host-qualified file:// URLs
+    return "file://" + urllib.parse.quote(os.path.abspath(path)) + (f"#{frag}" if frag else "")
+
+def statusline(data, table=None, links=None, out_dir=None):
     model = data.get("model") or {}
     name = model.get("display_name") or model.get("id") or "?"
     tp = data.get("transcript_path")
     s = None
     if tp and os.path.isfile(tp):
-        sessions = analyze(session_files(tp), table)
-        s = sessions.get(data.get("session_id")) or (next(iter(sessions.values())) if sessions else None)
+        ttl = (data.get("prompt_cache") or {}).get("ttl") if not os.environ.get("CLAUDE_COST_CACHE_TTL") else None
+        sessions = analyze(session_files(tp), table, default_ttl=ttl if ttl in ("5m", "1h") else None)
+        s = sessions.get(data.get("session_id"))
+        if s is None and sessions:
+            s = next(iter(sessions.values()))
+        # entries from subagent files of this session that ended up under another id are still this session's
+        if s is not None:
+            for other in list(sessions.values()):
+                if other is not s and other.id not in (data.get("session_id"),):
+                    s.merge(other)
     cc_cost = (data.get("cost") or {}).get("total_cost_usd")
     parts = [c("36", f"[{name}]")]
     if s:
@@ -422,7 +493,14 @@ def statusline(data, table=None):
                      f"cw {fmt_tok(t['cache_write_5m'] + t['cache_write_1h'])} · cr {fmt_tok(t['cache_read'])}")
         nt = sum(s.usage.tools.values()); nm = sum(v["calls"] for v in s.usage.mcp.values())
         if nt:
-            parts.append(c("2", f"tools {nt}" + (f" · mcp {nm}" if nm else "")))
+            seg_t, seg_m = f"tools {nt}", f"mcp {nm}"
+            if links_enabled(links):
+                try:
+                    page = write_usage_page(s, out_dir, model_name=name, cc_cost=cc_cost)
+                    seg_t, seg_m = osc8(file_url(page, "tools"), seg_t), osc8(file_url(page, "mcp"), seg_m)
+                except OSError:
+                    pass  # read-only home etc.: plain text, never break the statusline
+            parts.append(c("2", seg_t + (f" · {seg_m}" if nm else "")))
         if s.unknown_models:
             parts.append(c("31", "?unpriced model"))
     elif cc_cost is not None:
@@ -508,13 +586,148 @@ def usage_report(sessions, limit=None):
         out.append("  - none detected")
     return "\n".join(out)
 
+# ---------------------------------------------------------------------------
+# Per-session usage page (target of the clickable "tools N" / "mcp M" segments)
+
+def usage_dir(override=None):
+    return os.path.expanduser(override or os.environ.get("CLAUDE_COST_DIR")
+                              or os.path.join(os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude")), "claude-cost"))
+
+def _mcp_rows(u):
+    return sorted(u.mcp.items(), key=lambda kv: (-kv[1]["calls"], kv[0]))
+
+def _mcp_servers(u):
+    out = {}
+    for k, v in u.mcp.items():
+        srv = k.split("/")[0]
+        d = out.setdefault(srv, {"calls": 0, "result_tokens_est": 0, "result_cost_est": 0.0, "output_tokens_est": 0.0})
+        for f in d:
+            d[f] += v[f]
+    return sorted(out.items(), key=lambda kv: -kv[1]["calls"])
+
+def usage_markdown(s, model_name=None, cc_cost=None):
+    u = s.usage
+    L = [f"# Claude Code session {s.id}", "",
+         f"- project: `{s.project or '-'}`", f"- model: {model_name or ', '.join(s.models) or '-'}",
+         f"- cost (claude-cost, from transcripts): {fmt_usd(s.cost)}" + (f"  (subagents {fmt_usd(s.sidechain_cost)})" if s.sidechain_cost else ""),
+         *( [f"- cost (Claude Code `cost.total_cost_usd`): {fmt_usd(cc_cost)}"] if cc_cost is not None else []),
+         f"- last activity: {s.last or '-'}", "",
+         f"## Tools ({sum(u.tools.values())} calls)", "", "| tool | calls |", "|---|---:|"]
+    L += [f"| {k} | {v} |" for k, v in sorted(u.tools.items(), key=lambda kv: (-kv[1], kv[0]))]
+    nm = sum(v["calls"] for v in u.mcp.values())
+    L += ["", f"## MCP ({nm} calls)", "", "_Token and cost columns are ESTIMATES: tool_result chars/4 priced at the model's input rate; "
+          "output = the issuing turn's output split evenly across its tool calls._", ""]
+    if u.mcp:
+        L += ["| server | calls | ~result tokens | ~result $ | ~output tokens |", "|---|---:|---:|---:|---:|"]
+        L += [f"| {k} | {v['calls']} | {v['result_tokens_est']} | {v['result_cost_est']:.4f} | {round(v['output_tokens_est'])} |" for k, v in _mcp_servers(u)]
+        L += ["", "| server/tool | calls | ~result tokens | ~result $ | ~output tokens |", "|---|---:|---:|---:|---:|"]
+        L += [f"| {k} | {v['calls']} | {v['result_tokens_est']} | {v['result_cost_est']:.4f} | {round(v['output_tokens_est'])} |" for k, v in _mcp_rows(u)]
+    else:
+        L.append("none")
+    for title, d in (("Skills", u.skills), ("Slash commands", u.slash), ("Bash commands", u.bash)):
+        if d:
+            L += ["", f"## {title}", "", ", ".join(f"`{k}` ×{v}" for k, v in sorted(d.items(), key=lambda kv: -kv[1]))]
+    if u.rules:
+        L += ["", "## Rules / memory files seen", ""] + [f"- `{p}` [{', '.join(sorted(h))}]" for p, h in sorted(u.rules.items())]
+    return "\n".join(L) + "\n"
+
+_CSS = ("body{font:14px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;margin:2em auto;max-width:960px;padding:0 1em;"
+        "color:#1d1d1f;background:#fff}@media(prefers-color-scheme:dark){body{color:#e6e6e6;background:#1b1b1d}"
+        "th{background:#2a2a2e!important}td,th{border-color:#3a3a3e!important}}h1{font-size:1.3em}h2{margin-top:1.6em}"
+        "table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:4px 8px}th{background:#f4f4f6;text-align:left}"
+        "td.n{text-align:right;font-variant-numeric:tabular-nums}.est{color:#a15c00}code{font-size:.95em}.meta td:first-child{width:14em}")
+
+def usage_html(s, model_name=None, cc_cost=None):
+    e = html.escape
+    u = s.usage
+    def table(head, rows, num_from=1):
+        h = "".join(f"<th>{e(x)}</th>" for x in head)
+        b = "".join("<tr>" + "".join(f"<td{' class=n' if i >= num_from else ''}>{e(str(x))}</td>" for i, x in enumerate(r)) + "</tr>" for r in rows)
+        return f"<table><tr>{h}</tr>{b}</table>"
+    meta = [("session", s.id), ("project", s.project or "-"), ("model", model_name or ", ".join(s.models) or "-"),
+            ("cost (claude-cost)", fmt_usd(s.cost) + (f"  (subagents {fmt_usd(s.sidechain_cost)})" if s.sidechain_cost else ""))]
+    if cc_cost is not None:
+        meta.append(("cost (Claude Code cc)", fmt_usd(cc_cost)))
+    meta += [("tokens", " · ".join(f"{k} {fmt_tok(v)}" for k, v in s.tokens.items() if v)), ("last activity", s.last or "-")]
+    nm = sum(v["calls"] for v in u.mcp.values())
+    est = "<p class=est>MCP token and cost columns are <b>estimates</b>: tool_result chars/4 priced at the model's input rate; output = the issuing turn's output split evenly across its tool calls.</p>"
+    mrow = lambda kv: (kv[0], kv[1]["calls"], "~" + fmt_tok(kv[1]["result_tokens_est"]), "~" + fmt_usd(kv[1]["result_cost_est"]), "~" + fmt_tok(round(kv[1]["output_tokens_est"])))
+    mh = ["calls", "~result tokens", "~result $", "~output tokens"]
+    parts = [f"<!doctype html><html><head><meta charset=utf-8><title>claude-cost {e(s.id[:8])}</title><style>{_CSS}</style></head><body>",
+             f"<h1>Claude Code session usage</h1>", "<table class=meta>" + "".join(f"<tr><td>{e(k)}</td><td>{e(v)}</td></tr>" for k, v in meta) + "</table>",
+             f"<h2 id=tools>Tools ({sum(u.tools.values())} calls)</h2>",
+             table(["tool", "calls"], sorted(u.tools.items(), key=lambda kv: (-kv[1], kv[0]))) if u.tools else "<p>none</p>",
+             f"<h2 id=mcp>MCP ({nm} calls)</h2>"]
+    if u.mcp:
+        parts += [est, "<h3>By server</h3>", table(["server"] + mh, map(mrow, _mcp_servers(u))),
+                  "<h3>By tool</h3>", table(["server/tool"] + mh, map(mrow, _mcp_rows(u)))]
+    else:
+        parts.append("<p>none</p>")
+    for title, d in (("Skills", u.skills), ("Slash commands", u.slash), ("Bash commands", u.bash)):
+        if d:
+            parts += [f"<h2>{title}</h2>", table(["name", "count"], sorted(d.items(), key=lambda kv: -kv[1]))]
+    if u.rules:
+        parts += ["<h2>Rules / memory files seen</h2>", table(["path", "how"], [(p, ", ".join(sorted(h))) for p, h in sorted(u.rules.items())], 9)]
+    parts.append(f"<p class=est>Generated by claude-cost at {e(dt.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z'))}. Regenerated when the counts change.</p></body></html>")
+    return "\n".join(parts)
+
+def _atomic_write(path, text):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+def page_signature(s, cc_cost=None):
+    u = s.usage
+    return json.dumps([sorted(u.tools.items()), sorted((k, v["calls"]) for k, v in u.mcp.items()), sorted(u.skills.items()),
+                       sorted(u.slash.items()), sorted(u.bash.items()), sorted(u.rules), round(s.cost, 2),
+                       None if cc_cost is None else round(cc_cost, 2)])
+
+def write_usage_page(s, out_dir=None, model_name=None, cc_cost=None, force=False):
+    """Write <dir>/<sid>.html and .md; skipped when the counts/cost signature is unchanged. Returns the html path."""
+    d = usage_dir(out_dir)
+    os.makedirs(d, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", s.id) or "session"
+    page, sigf = os.path.join(d, safe + ".html"), os.path.join(d, safe + ".sig")
+    sig = page_signature(s, cc_cost)
+    try:
+        if not force and os.path.exists(page) and open(sigf, encoding="utf-8").read() == sig:
+            return page
+    except OSError:
+        pass
+    _atomic_write(page, usage_html(s, model_name, cc_cost))
+    _atomic_write(os.path.join(d, safe + ".md"), usage_markdown(s, model_name, cc_cost))
+    _atomic_write(sigf, sig)
+    _atomic_write(os.path.join(d, "last-session"), s.id + "\n")
+    return page
+
+def open_path(path):
+    import subprocess, webbrowser
+    opener = "open" if sys.platform == "darwin" else ("xdg-open" if not sys.platform.startswith("win") else None)
+    try:
+        if opener:
+            subprocess.Popen([opener, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        return webbrowser.open(file_url(path))
+    except OSError:
+        return webbrowser.open(file_url(path))
+
 def find_transcripts(root):
     return sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True))
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="claude-cost", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd")
-    sub.add_parser("statusline", help="read statusLine JSON on stdin (default when stdin is piped)")
+    sl = sub.add_parser("statusline", help="read statusLine JSON on stdin (default when stdin is piped)")
+    sl.add_argument("--no-links", action="store_true", help="no OSC 8 links / usage page (same as CLAUDE_COST_LINKS=0)")
+    sl.add_argument("--usage-dir", help="where usage pages go (default $CLAUDE_COST_DIR or ~/.claude/claude-cost)")
+    us = sub.add_parser("usage", help="write (and optionally open) the usage page for the current/last session")
+    us.add_argument("session", nargs="?", help="session id or prefix (default: most recently active session)")
+    us.add_argument("--open", action="store_true", help="open the HTML page in the default browser")
+    us.add_argument("--md", action="store_true", help="print the markdown path instead of the HTML path")
+    us.add_argument("--usage-dir", help="where usage pages go (default $CLAUDE_COST_DIR or ~/.claude/claude-cost)")
+    us.add_argument("--dir", default=os.path.join(os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude")), "projects"),
+                    help="transcripts root (default ~/.claude/projects)")
     r = sub.add_parser("report", help="per-session costs from past transcripts")
     r.add_argument("-n", "--last", type=int, default=10, help="show the N most recent sessions (default 10, 0=all)")
     r.add_argument("--today", action="store_true", help="only usage since local midnight")
@@ -532,9 +745,21 @@ def main(argv=None):
         except ValueError:
             data = {}
         try:
-            print(statusline(data))
+            print(statusline(data, links=False if getattr(a, "no_links", False) else None, out_dir=getattr(a, "usage_dir", None)))
         except Exception as ex:  # never blank the statusline
             print(f"claude-cost: {ex}")
+        return 0
+    if cmd == "usage":
+        sessions = analyze(find_transcripts(a.dir))
+        cand = [x for x in sessions.values() if not a.session or x.id.startswith(a.session)]
+        if not cand:
+            print(f"claude-cost: no session{' matching ' + a.session if a.session else ''} under {a.dir}", file=sys.stderr)
+            return 1
+        s = max(cand, key=lambda x: x.last or "")
+        page = write_usage_page(s, a.usage_dir, force=True)
+        print(os.path.splitext(page)[0] + ".md" if a.md else page)
+        if a.open:
+            open_path(page)
         return 0
     if cmd == "pricing":
         print(json.dumps({"source": PRICING_SOURCE, "retrieved": PRICING_DATE, "usd_per_mtok": load_pricing()}, indent=2))

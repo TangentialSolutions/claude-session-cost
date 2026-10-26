@@ -7,6 +7,11 @@ import claude_cost as cc
 SID = "11111111-aaaa-bbbb-cccc-000000000001"
 BASIC = os.path.join(HERE, "fixtures", "basic", SID + ".jsonl")
 os.environ["NO_COLOR"] = "1"
+import re, tempfile
+os.environ["CLAUDE_COST_DIR"] = tempfile.mkdtemp(prefix="claude-cost-test-")
+os.environ.pop("CLAUDE_COST_LINKS", None); os.environ.pop("CLAUDE_COST_CACHE_TTL", None); os.environ.pop("TERM_PROGRAM", None)
+OSC8 = re.compile(r"\x1b\]8;;[^\x07]*\x07")
+def plain(s): return OSC8.sub("", s)
 
 class T(unittest.TestCase):
     def test_normalize(self):
@@ -146,4 +151,117 @@ class Usage(unittest.TestCase):
 
     def test_statusline_segment(self):
         line = cc.statusline({"session_id": USID, "transcript_path": UFILE, "model": {"display_name": "Sonnet"}})
-        self.assertIn("tools 8 · mcp 3", line)
+        self.assertIn("tools 8 · mcp 3", plain(line))
+
+GSID = "33333333-aaaa-bbbb-cccc-000000000003"
+GFILE = os.path.join(HERE, "fixtures", "gap", GSID + ".jsonl")
+
+class Links(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cc-links-")
+        self.data = {"session_id": USID, "transcript_path": UFILE, "model": {"display_name": "Sonnet"}}
+
+    def test_osc8_and_page(self):
+        line = cc.statusline(self.data, out_dir=self.dir)
+        page = os.path.join(self.dir, USID + ".html")
+        self.assertIn("\x1b]8;;file://" + page + "#tools\x07tools 8\x1b]8;;\x07", line)
+        self.assertIn("#mcp\x07mcp 3\x1b]8;;\x07", line)
+        h = open(page).read()
+        for needle in ('id=tools', 'id=mcp', "github/search_issues", "linear-server", "estimates", "Bash"):
+            self.assertIn(needle, h)
+        md = open(os.path.join(self.dir, USID + ".md")).read()
+        self.assertIn("| github/search_issues | 2 |", md)
+        self.assertEqual(open(os.path.join(self.dir, "last-session")).read().strip(), USID)
+
+    def test_page_throttled(self):
+        cc.statusline(self.data, out_dir=self.dir)
+        page = os.path.join(self.dir, USID + ".html")
+        os.utime(page, (1, 1))
+        cc.statusline(self.data, out_dir=self.dir)
+        self.assertEqual(os.stat(page).st_mtime, 1)          # unchanged counts -> not rewritten
+        cc.statusline(dict(self.data, cost={"total_cost_usd": 9.99}), out_dir=self.dir)
+        self.assertNotEqual(os.stat(page).st_mtime, 1)       # changed -> rewritten
+
+    def test_links_off(self):
+        for env in ({"CLAUDE_COST_LINKS": "0"}, {"TERM_PROGRAM": "Apple_Terminal"}):
+            os.environ.update(env)
+            try:
+                line = cc.statusline(self.data, out_dir=self.dir)
+            finally:
+                for k in env: os.environ.pop(k)
+            self.assertNotIn("\x1b]8", line); self.assertIn("tools 8 · mcp 3", line)
+        self.assertNotIn("\x1b]8", cc.statusline(self.data, links=False, out_dir=self.dir))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, USID + ".html")))
+
+    def test_html_escaped(self):
+        s = cc.Session("<x>"); s.usage.tools["<script>"] = 1
+        self.assertNotIn("<script>", cc.usage_html(s)); self.assertIn("&lt;script&gt;", cc.usage_html(s))
+
+    def test_usage_command(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cc.main(["usage", "--dir", os.path.dirname(UFILE), "--usage-dir", self.dir])
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue().strip(), os.path.join(self.dir, USID + ".html"))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cc.main(["usage", "2222", "--md", "--dir", os.path.dirname(UFILE), "--usage-dir", self.dir])
+        self.assertTrue(buf.getvalue().strip().endswith(".md"))
+        self.assertEqual(cc.main(["usage", "nope", "--dir", os.path.dirname(UFILE), "--usage-dir", self.dir]), 1)
+
+class Gap(unittest.TestCase):
+    """Reproduces the statusline-vs-cc gap for a Sonnet [1m] session with 2 subagents."""
+    def rates(self):
+        return cc.load_pricing()["sonnet-4-5"]
+
+    def test_all_subagent_files_attributed_to_parent(self):
+        files = cc.session_files(GFILE)
+        names = [os.path.basename(f) for f in files]
+        self.assertIn("agent-aaaa1111.jsonl", names)        # <sid>/subagents/, lines without sessionId
+        self.assertIn("agent-bbbb2222.jsonl", names)        # legacy sibling with matching sessionId
+        self.assertNotIn("agent-cccc3333.jsonl", names)     # other session's sibling
+        sessions = cc.analyze(files, default_ttl="5m")
+        self.assertEqual(list(sessions), [GSID])
+        self.assertEqual(sessions[GSID].messages, 5)
+
+    def test_long_context_tier(self):
+        r = self.rates()
+        u = cc.split_usage({"input_tokens": 1000, "cache_read_input_tokens": 240000, "cache_creation_input_tokens": 5000, "output_tokens": 2000})
+        self.assertAlmostEqual(cc.cost_of(u, r, False), (1000 * 6 + 240000 * 0.6 + 5000 * 7.5 + 2000 * 22.5) / 1e6)
+        u = cc.split_usage({"input_tokens": 1000, "cache_read_input_tokens": 150000, "output_tokens": 2000})
+        self.assertAlmostEqual(cc.cost_of(u, r, False), (1000 * 3 + 150000 * 0.3 + 2000 * 15) / 1e6)
+
+    def test_unsplit_cache_ttl(self):
+        u = {"input_tokens": 0, "cache_creation_input_tokens": 1000, "output_tokens": 0}
+        self.assertEqual(cc.split_usage(u)["cache_write_5m"], 1000)
+        self.assertEqual(cc.split_usage(u, "1h")["cache_write_1h"], 1000)
+        os.environ["CLAUDE_COST_CACHE_TTL"] = "1h"
+        try:
+            self.assertEqual(cc.default_cache_ttl(), "1h")
+        finally:
+            os.environ.pop("CLAUDE_COST_CACHE_TTL")
+        a = cc.analyze(cc.session_files(GFILE), default_ttl="5m")[GSID].cost
+        b = cc.analyze(cc.session_files(GFILE), default_ttl="1h")[GSID].cost
+        self.assertAlmostEqual(b - a, 34000 * (6 - 3.75) / 1e6 + 15000 * (12 - 7.5) / 1e6)
+
+    def test_statusline_uses_prompt_cache_ttl_and_subagents(self):
+        def cost(ttl):
+            line = plain(cc.statusline({"session_id": GSID, "transcript_path": GFILE, "model": {"display_name": "Sonnet 4.5"},
+                                        "prompt_cache": {"ttl": ttl}}, links=False))
+            return float(re.search(r"\$(\d+\.\d+)", line).group(1))
+        self.assertAlmostEqual(cost("5m"), 0.83, places=2)   # was $0.46 before the fixes
+        self.assertAlmostEqual(cost("1h"), 0.97, places=2)
+
+    def test_relogged_sidechain_keeps_main_attribution(self):
+        import json as _j
+        d = tempfile.mkdtemp(); sid = "44444444-0000-0000-0000-000000000004"
+        row = {"type": "assistant", "sessionId": sid, "requestId": "r", "timestamp": "2026-10-26T10:00:00Z",
+               "message": {"id": "m", "model": "claude-sonnet-4-5", "usage": {"input_tokens": 1000, "output_tokens": 10}}}
+        os.makedirs(os.path.join(d, sid, "subagents"))
+        open(os.path.join(d, sid + ".jsonl"), "w").write(_j.dumps(row) + "\n")
+        open(os.path.join(d, sid, "subagents", "agent-aside_question-x.jsonl"), "w").write(_j.dumps(dict(row, isSidechain=True)) + "\n")
+        s = cc.analyze(cc.session_files(os.path.join(d, sid + ".jsonl")))[sid]
+        self.assertEqual(s.messages, 1); self.assertEqual(s.sidechain_cost, 0)
+
+if __name__ == "__main__":
+    unittest.main()

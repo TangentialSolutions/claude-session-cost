@@ -7,18 +7,20 @@ CW = f.getlength("M"); LH = 22
 COL = {"31": (240, 98, 98), "33": (240, 200, 90), "36": (90, 200, 220), "2": (130, 136, 150)}
 FG, BG = (220, 223, 228), (24, 26, 32)
 def parse(line):
-    out, st = [], {"c": FG, "b": False}
-    for part in re.split(r"(\x1b\[[0-9;]*m)", line):
+    out, st = [], {"c": FG, "b": False, "u": False}
+    for part in re.split(r"(\x1b\[[0-9;]*m|\x1b\]8;;[^\x07]*\x07)", line):
         m = re.match(r"\x1b\[([0-9;]*)m", part)
-        if m:
+        if part.startswith("\x1b]8;;"):
+            st = dict(st, u=part != "\x1b]8;;\x07")  # OSC 8 link -> underline
+        elif m:
             for code in (m.group(1) or "0").split(";"):
-                if code == "0": st = {"c": FG, "b": False}
+                if code == "0": st = {"c": FG, "b": False, "u": st.get("u", False)}
                 elif code == "1": st["b"] = True
                 elif code in COL: st["c"] = COL[code]
         elif part: out.append((part, dict(st)))
     return out
 blocks = [(sys.argv[i], open(sys.argv[i + 1]).read().rstrip("\n").split("\n")) for i in range(2, len(sys.argv), 2)]
-width = int(max(len(re.sub(r"\x1b\[[0-9;]*m", "", l)) for _, ls in blocks for l in ls) * CW) + 60
+width = int(max(len(re.sub(r"\x1b\[[0-9;]*m|\x1b\]8;;[^\x07]*\x07", "", l)) for _, ls in blocks for l in ls) * CW) + 60
 height = 50 + sum(LH * (len(ls) + 2) + 10 for _, ls in blocks)
 img = Image.new("RGB", (width, height), BG); d = ImageDraw.Draw(img)
 d.rectangle([0, 0, width, 30], fill=(40, 43, 52))
@@ -29,7 +31,9 @@ for title, lines in blocks:
     for l in lines:
         x = 30
         for txt, st in parse(l):
-            d.text((x, y), txt, font=fb if st["b"] else f, fill=st["c"]); x += f.getlength(txt)
+            d.text((x, y), txt, font=fb if st["b"] else f, fill=st["c"])
+            if st.get("u"): d.line([x, y + SZ + 2, x + f.getlength(txt), y + SZ + 2], fill=(110, 160, 255), width=1)
+            x += f.getlength(txt)
         y += LH
     y += LH
 img.save(sys.argv[1])
