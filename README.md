@@ -108,6 +108,35 @@ mkdir -p ~/.claude && curl -fsSL https://raw.githubusercontent.com/TangentialSol
 
 Claude Code reloads settings automatically. For the report, optionally `alias claude-cost='python3 ~/.claude/claude_cost.py'`. Windows: use forward slashes in the command path (e.g. `python C:/Users/you/.claude/claude_cost.py statusline`). Set `NO_COLOR=1` to disable ANSI colors.
 
+## Update (no clone needed)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TangentialSolutions/claude-session-cost/main/update.sh | bash
+```
+
+Or, from an existing install of 0.4.0 or later:
+
+```bash
+python3 ~/.claude/claude_cost.py update                # latest main
+python3 ~/.claude/claude_cost.py update --ref v0.4.0   # a tag, branch or commit sha
+```
+
+Both forms do the same steps:
+1. Download `claude_cost.py` to a temp file next to the install.
+2. Verify it: the download is non-empty, `python3 -m py_compile` passes, and `--version` runs.
+3. Back up the current file to `~/.claude/claude_cost.py.bak-YYYYmmdd-HHMMSS`, keeping the newest 3 backups.
+4. Replace the file with an atomic rename and print `old -> new` versions.
+
+If the file is unchanged, they print `already up to date` and change nothing. They never touch `settings.json`, `claude-cost-pricing.json` or `~/.claude/claude-cost/`.
+
+| Option | Script form | Subcommand form |
+|---|---|---|
+| Pick a release | `curl … \| bash -s -- --ref <tag/sha>` | `update --ref <tag/sha>` |
+| Install somewhere other than `~/.claude` | `CLAUDE_COST_HOME=/path` (or `--home /path`) | `CLAUDE_COST_HOME=/path` (or `--home /path`) |
+| Download from a mirror or local file | `CLAUDE_COST_UPDATE_URL=<full url>` (curl accepts `file://`) | `CLAUDE_COST_UPDATE_URL=<full url>` |
+
+`update.sh` needs only bash 3.2 or later, BSD or GNU tools, curl and python3. It runs with `set -euo pipefail` and passes shellcheck. Check your installed version with `python3 ~/.claude/claude_cost.py --version`. To roll back, run `cp ~/.claude/claude_cost.py.bak-<stamp> ~/.claude/claude_cost.py`.
+
 ## How cost is computed
 
 **Data source.** Claude Code pipes a JSON object to the statusline command on stdin ([docs](https://code.claude.com/docs/en/statusline)); this tool uses `session_id`, `transcript_path`, `model.display_name` and `cost.total_cost_usd`. It then reads the session transcript, a JSONL file under `~/.claude/projects/<encoded-project-path>/<session_id>.jsonl` (plus any subagent transcripts in `<session_id>/subagents/*.jsonl`). The report scans every `*.jsonl` under `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects`, or `--dir`).
@@ -186,7 +215,8 @@ On the fixture, the old code showed **$0.46** in the status line, against $0.83 
 
 ```bash
 python3 tests/make_fixtures.py        # regenerate fake fixtures
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v   # includes update.sh tests (fake HOME, file:// URL)
+shellcheck update.sh
 python3 docs/render.py …              # screenshot helper (needs Pillow; dev only)
 ```
 

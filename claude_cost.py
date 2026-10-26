@@ -3,6 +3,8 @@
 
   statusline   read Claude Code's statusLine JSON on stdin, print a cost line
   report       summarize past sessions from ~/.claude/projects/**/*.jsonl
+  usage        write/open the per-session usage page
+  update       replace this file with the latest release (verified, backed up)
 
 Single file, Python 3.8+ standard library only. MIT licensed.
 """
@@ -16,6 +18,7 @@ import argparse, datetime as dt, glob, html, json, os, re, sys, urllib.parse
 # or drop ~/.claude/claude-cost-pricing.json.
 # ---------------------------------------------------------------------------
 PRICING_SOURCE = "https://docs.claude.com/en/docs/about-claude/pricing"
+__version__ = "0.4.0"
 PRICING_DATE = "2026-10-26"
 PRICING = {
     "fable-5-1":  {"input": 10,   "cache_write_5m": 12.5,  "cache_write_1h": 20,   "cache_read": 0.25, "output": 50},
@@ -712,12 +715,84 @@ def open_path(path):
     except OSError:
         return webbrowser.open(file_url(path))
 
+# ---------------------------------------------------------------------------
+# Self-update (no clone needed). Mirrors update.sh.
+
+REPO_RAW = "https://raw.githubusercontent.com/TangentialSolutions/claude-session-cost"
+KEEP_BACKUPS = 3
+
+def _file_version(path):
+    try:
+        m = re.search(r"""^__version__\s*=\s*["']([^"']+)["']""", open(path, encoding="utf-8").read(), re.M)
+        return m.group(1) if m else "unknown"
+    except OSError:
+        return "none"
+
+def _download(url, dest):
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=30) as r, open(dest, "wb") as f:
+        f.write(r.read())
+
+def self_update(ref="main", home=None, url=None, out=print):
+    """Download, verify, back up, atomically replace. Returns 0 on success/up to date, 1 on failure."""
+    import py_compile, subprocess, tempfile, time
+    home = os.path.expanduser(home or os.environ.get("CLAUDE_COST_HOME") or "~/.claude")
+    target = os.path.join(home, "claude_cost.py")
+    url = url or os.environ.get("CLAUDE_COST_UPDATE_URL") or f"{REPO_RAW}/{ref}/claude_cost.py"
+    os.makedirs(home, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".claude_cost.", suffix=".py", dir=home)  # same fs -> atomic rename
+    os.close(fd)
+    try:
+        try:
+            _download(url, tmp)
+        except Exception as ex:
+            out(f"claude-cost update: download failed: {url}: {ex}"); return 1
+        if os.path.getsize(tmp) == 0:
+            out(f"claude-cost update: empty download from {url}"); return 1
+        try:
+            with tempfile.TemporaryDirectory() as cdir:
+                py_compile.compile(tmp, cfile=os.path.join(cdir, "c.pyc"), doraise=True)
+        except py_compile.PyCompileError as ex:
+            out(f"claude-cost update: downloaded file does not compile: {ex.msg.strip()}"); return 1
+        try:
+            p = subprocess.run([sys.executable, "-B", tmp, "--version"], capture_output=True, text=True, timeout=30)
+        except Exception as ex:
+            out(f"claude-cost update: --version failed: {ex}"); return 1
+        if p.returncode != 0 or not p.stdout.strip():
+            out("claude-cost update: downloaded file failed --version"); return 1
+        new_v = p.stdout.strip().split()[-1]
+        old_v = _file_version(target)
+        if os.path.exists(target) and open(target, "rb").read() == open(tmp, "rb").read():
+            out(f"claude-cost {old_v}: already up to date"); return 0
+        if os.path.exists(target):
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            bak = f"{target}.bak-{stamp}"
+            if os.path.exists(bak):
+                bak += f"-{os.getpid()}"
+            import shutil
+            shutil.copy2(target, bak)
+            baks = sorted(glob.glob(glob.escape(target) + ".bak-*"))
+            for old in baks[:-KEEP_BACKUPS]:
+                os.remove(old)
+            out(f"backup: {bak}")
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, target)
+        out(f"claude-cost updated: {old_v} -> {new_v} ({target})")
+        return 0
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
 def find_transcripts(root):
     return sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True))
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="claude-cost", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"claude-cost {__version__}")
     sub = p.add_subparsers(dest="cmd")
+    up = sub.add_parser("update", help="download the latest claude_cost.py, verify it, back up and replace this install")
+    up.add_argument("--ref", default="main", help="branch, tag or commit sha to install (default main)")
+    up.add_argument("--home", help="install dir (default $CLAUDE_COST_HOME or ~/.claude)")
     sl = sub.add_parser("statusline", help="read statusLine JSON on stdin (default when stdin is piped)")
     sl.add_argument("--no-links", action="store_true", help="no OSC 8 links / usage page (same as CLAUDE_COST_LINKS=0)")
     sl.add_argument("--usage-dir", help="where usage pages go (default $CLAUDE_COST_DIR or ~/.claude/claude-cost)")
@@ -749,6 +824,8 @@ def main(argv=None):
         except Exception as ex:  # never blank the statusline
             print(f"claude-cost: {ex}")
         return 0
+    if cmd == "update":
+        return self_update(a.ref, a.home)
     if cmd == "usage":
         sessions = analyze(find_transcripts(a.dir))
         cand = [x for x in sessions.values() if not a.session or x.id.startswith(a.session)]
